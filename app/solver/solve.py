@@ -24,7 +24,16 @@ class SearchLimit(Exception):
     pass
 
 
-def solve(prob: Problem) -> SolveResult:
+def solve(prob: Problem, stock_costs: Optional[dict] = None) -> SolveResult:
+    """Solve ``prob``; optionally minimize the total stock cost.
+
+    ``stock_costs`` maps every stock id to its non-negative rational price
+    per nanoliter (``Fraction``). When given, the search is exhaustive
+    (branch and bound over the whole option tree) and returns a plan whose
+    total stock cost -- sum over stocks of drawn nanoliters times unit
+    price -- is minimal within the candidate space; when ``None`` the
+    search stops at the first feasible plan (the historical behavior).
+    """
     pip = make_pip(prob.pip_min, prob.pip_max, prob.pip_step)
 
     # ---- structural prechecks ------------------------------------------- #
@@ -34,6 +43,13 @@ def solve(prob: Problem) -> SolveResult:
 
     wells = sorted(prob.wells, key=_difficulty)
     assign = Assignment(prob, pip)
+    if stock_costs is None:
+        return _solve_first(prob, pip, wells, assign)
+    return _solve_min_cost(prob, pip, wells, assign, stock_costs)
+
+
+def _solve_first(prob: Problem, pip, wells, assign: Assignment) -> SolveResult:
+    """Depth-first search returning the first feasible plan."""
     nodes_used = 0
     limit = prob.max_search_nodes
 
@@ -81,6 +97,115 @@ def solve(prob: Problem) -> SolveResult:
             # Internal inconsistency: never hand back an unsound plan.
             raise RuntimeError("solver produced invalid plan: " + verification)
         return SolveResult(ok=True, plan=plan)
+
+    return SolveResult(ok=False, failure=_explain(prob, pip, wells, reasons))
+
+
+def _stock_draws(prob: Problem, assign: Assignment, batches: dict) -> dict:
+    """Nanoliters drawn from each stock by the current assignment.
+
+    Direct well fills from stocks plus the high/low parent draws of every
+    produced intermediate batch that come straight from a stock. ``batches``
+    is the evaluate() sizing for the *current* demand; demand and batch
+    sizes only grow as more wells are assigned, so on a partial assignment
+    this is a lower bound on the draws of any completion.
+    """
+    usage = {sid: u for sid, u in assign.stock_used.items() if u}
+    for key, x in batches.items():
+        r = prob.recipes[key]
+        hi_nl = x * r.frac.numerator // r.frac.denominator
+        lo_nl = x - hi_nl
+        for parent, amount in ((r.hi, hi_nl), (r.lo, lo_nl)):
+            if amount and parent[0] == STOCK:
+                usage[parent[1]] = usage.get(parent[1], 0) + amount
+    return usage
+
+
+def _solve_min_cost(prob: Problem, pip, wells, assign: Assignment,
+                    costs: dict) -> SolveResult:
+    """Branch-and-bound search for the lowest-total-stock-cost plan.
+
+    The whole option tree is explored (the cost of a plan is a global
+    property -- wells share intermediates -- so per-well greedy choices
+    cannot prove optimality). The cost of a partial assignment is a valid
+    lower bound for every completion because stock draws only grow along
+    the search, so branches whose bound already reaches the incumbent are
+    pruned. If the node budget is exhausted before the tree is, optimality
+    is unproven and a ``search_limit`` failure is returned (the caller
+    turns that into a retryable resource-limit answer instead of freezing
+    a wrong "infeasible").
+    """
+    nodes_used = 0
+    limit = prob.max_search_nodes
+    best = {"cost": None, "plan": None}
+
+    def record(assign_: Assignment, batches: dict, container_map: dict):
+        usage = _stock_draws(prob, assign_, batches)
+        cost = sum((costs[sid] * nl for sid, nl in usage.items()),
+                   Fraction(0))
+        if best["cost"] is None or cost < best["cost"]:
+            best["cost"] = cost
+            best["plan"] = _assemble(prob, pip, assign_, batches,
+                                     container_map)
+
+    def dfs(idx: int):
+        nonlocal nodes_used
+        if idx == len(wells):
+            evaluated, _ = assign.evaluate()
+            batches, container_map = evaluated
+            record(assign, batches, container_map)
+            return {}
+        nodes_used += 1
+        if nodes_used > limit:
+            raise SearchLimit()
+        well = wells[idx]
+        opts = generate_options(prob, pip, well)
+        if not opts:
+            return {well.id: {"no_fill_option"}}
+        all_reasons: dict = {}
+        found = False
+        for opt in opts:
+            new_records = assign.apply(well, opt)
+            evaluated, reasons = assign.evaluate()
+            if evaluated is not None:
+                batches, _container_map = evaluated
+                prune = False
+                if best["cost"] is not None:
+                    bound = sum(
+                        (costs[sid] * nl
+                         for sid, nl in _stock_draws(prob, assign,
+                                                     batches).items()),
+                        Fraction(0))
+                    if bound >= best["cost"]:
+                        prune = True
+                if not prune:
+                    sub = dfs(idx + 1)
+                    if not sub:
+                        found = True
+                    else:
+                        for wid, codes in sub.items():
+                            all_reasons.setdefault(wid, set()).update(codes)
+            else:
+                for code in reasons:
+                    all_reasons.setdefault(well.id, set()).add(code)
+            assign.revert(well, new_records)
+        if found:
+            return {}
+        if not all_reasons:
+            all_reasons[well.id] = {"search_exhausted"}
+        return all_reasons
+
+    try:
+        reasons = dfs(0)
+    except SearchLimit:
+        return SolveResult(ok=False, failure=_limit_failure(prob, wells))
+
+    if best["plan"] is not None:
+        verification = verify_plan(prob, pip, best["plan"])
+        if verification is not None:
+            # Internal inconsistency: never hand back an unsound plan.
+            raise RuntimeError("solver produced invalid plan: " + verification)
+        return SolveResult(ok=True, plan=best["plan"])
 
     return SolveResult(ok=False, failure=_explain(prob, pip, wells, reasons))
 

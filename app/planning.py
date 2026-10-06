@@ -73,6 +73,34 @@ def stock_usage_from_plan(plan: dict) -> dict:
     return usage
 
 
+def plan_cost_payload(usage: dict, costs: dict) -> dict:
+    """Cost block of a feasible min-cost plan (exact rational arithmetic).
+
+    ``usage`` maps batch_id -> nanoliters the plan draws from that batch;
+    ``costs`` maps batch_id -> its non-negative rational price per
+    nanoliter (``Fraction``). Batches the plan does not draw from have no
+    usage entry and contribute nothing to the total, mirroring the
+    ``reservations[]`` list. All cost figures are serialized as canonical
+    rational strings.
+    """
+    batches = []
+    total = Fraction(0)
+    for bid, nl in sorted(usage.items()):
+        cost = costs[bid] * nl
+        total += cost
+        batches.append({
+            "batch_id": bid,
+            "used_nl": nl,
+            "cost_per_nl": str(costs[bid]),
+            "cost": str(cost),
+        })
+    return {
+        "objective": "min_cost",
+        "total_cost": str(total),
+        "batches": batches,
+    }
+
+
 def _node_key(node: dict) -> tuple:
     """Identity key for a transfer endpoint.
 
@@ -169,6 +197,23 @@ def cross_validate_inventory(req: InventoryPlanIn) -> None:
     if len(set(req.batch_ids)) != len(req.batch_ids):
         raise ValueError("duplicate batch id")
     _validate_common(req)
+    if req.objective == "min_cost":
+        if req.batch_costs is None:
+            raise ValueError(
+                "batch_costs is required when objective is 'min_cost'")
+        candidates = set(req.batch_ids)
+        missing = [b for b in req.batch_ids if b not in req.batch_costs]
+        if missing:
+            raise ValueError(
+                "batch_costs must cover every candidate batch; missing: "
+                + ", ".join(missing))
+        extra = sorted(b for b in req.batch_costs if b not in candidates)
+        if extra:
+            raise ValueError(
+                "batch_costs names non-candidate batch(es): "
+                + ", ".join(extra))
+    elif req.batch_costs is not None:
+        raise ValueError("batch_costs requires objective 'min_cost'")
 
 
 def canonical_request(req) -> bytes:
@@ -179,6 +224,13 @@ def canonical_request(req) -> bytes:
     # same frozen-hash replay semantics.
     if data.get("execution_mode") == "whole":
         data.pop("execution_mode", None)
+    # Same normalization for the min-cost objective: the default objective
+    # and an absent cost table must not change the hash of pre-existing
+    # requests.
+    if data.get("objective") == "feasible":
+        data.pop("objective", None)
+    if data.get("batch_costs") is None:
+        data.pop("batch_costs", None)
 
     def norm(x):
         if isinstance(x, Fraction):

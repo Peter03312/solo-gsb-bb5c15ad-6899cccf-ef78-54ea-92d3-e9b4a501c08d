@@ -171,6 +171,15 @@ class InventoryPlanIn(BaseModel):
       the experimenter; each stock-source registration moves that step's
       reserved volume to ``used_nl``, and the plan is finalized (``complete``)
       or ``abort``ed explicitly.
+
+    ``objective`` selects the search goal:
+
+    * ``"feasible"`` (default): the first exact plan the search finds;
+    * ``"min_cost"``: the exact plan with the lowest total stock cost,
+      where each candidate batch's cost is ``batch_costs[batch_id]`` (a
+      non-negative rational price per nanoliter) times the volume the plan
+      draws from that batch. ``batch_costs`` is then required and must
+      cover every id in ``batch_ids`` exactly.
     """
     batch_ids: list[str] = Field(min_length=1)
     diluent: DiluentIn
@@ -180,6 +189,8 @@ class InventoryPlanIn(BaseModel):
     default_well_capacity_nl: int = Field(gt=0)
     limits: LimitsIn = Field(default_factory=LimitsIn)
     execution_mode: Literal["whole", "stepwise"] = "whole"
+    objective: Literal["feasible", "min_cost"] = "feasible"
+    batch_costs: Optional[dict[str, Union[str, int]]] = None
 
     @field_validator("batch_ids")
     @classmethod
@@ -191,6 +202,23 @@ class InventoryPlanIn(BaseModel):
                 raise ValueError(
                     "ids must not start with '@' (reserved prefix)")
         return v
+
+    @field_validator("batch_costs")
+    @classmethod
+    def _batch_costs(cls, v):
+        if v is None:
+            return v
+        out = {}
+        for bid, cost in v.items():
+            if not bid or len(bid) > 64:
+                raise ValueError("batch cost ids must be 1..64 characters")
+            if bid.startswith("@"):
+                raise ValueError(
+                    "ids must not start with '@' (reserved prefix)")
+            # Same input rules as concentrations: a non-negative rational
+            # (string or integer; floats and bools are rejected).
+            out[bid] = Concentration.validate(cost, f"batch_costs[{bid!r}]")
+        return out
 
 
 class RecallIn(BaseModel):

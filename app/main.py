@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from fractions import Fraction
 
 from fastapi import FastAPI, Header, Request
 from fastapi.encoders import jsonable_encoder
@@ -47,6 +48,7 @@ from .planning import (
     cross_validate_inventory,
     cross_validate_references,
     frozen_transfer,
+    plan_cost_payload,
     relabel_plan,
     request_hash,
     review_content_hash,
@@ -71,7 +73,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microplate Dilution Planner",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Computes an exact, executable pipetting plan for microplate wells. "
         "Volumes are integer nanoliters; concentrations are rationals. "
@@ -80,7 +82,13 @@ app = FastAPI(
         "Inventory plans may alternatively run in stepwise execution mode: "
         "the experimenter registers each frozen transfer in order, stock is "
         "charged only as its stock-out steps are registered, and the plan is "
-        "completed or aborted explicitly. Contaminated batches can be "
+        "completed or aborted explicitly. An inventory plan may also request "
+        "the min-cost objective: every candidate batch carries a "
+        "non-negative rational price per nanoliter and the search compares "
+        "whole-plan total stock cost (never per-well greedy); when the "
+        "search budget cannot prove optimality the answer is a retryable "
+        "resource-limit error, never a frozen infeasible result. "
+        "Contaminated batches can be "
         "irrevocably recalled: new reservations and pending steps/confirms "
         "are rejected, and the frozen recall report traces affected plans "
         "and target wells (for stepwise plans, only the executed path) "
@@ -530,9 +538,32 @@ async def create_inventory_plan(
         )
 
     prob = build_inventory_problem(req, batches)
-    result = solve(prob)
+    min_cost = req.objective == "min_cost"
+    costs = ({bid: Fraction(req.batch_costs[bid]) for bid in req.batch_ids}
+             if min_cost else None)
+    result = solve(prob, stock_costs=costs)
 
     if not result.ok:
+        if min_cost and result.failure.reason == "search_limit":
+            # The node budget ran out before the branch-and-bound search
+            # could prove the optimum: the answer is unknown, NOT
+            # infeasible. Reply with a retryable resource-limit error and
+            # freeze nothing / reserve nothing, so the same X-Request-ID
+            # stays usable (e.g. with a raised limits.max_search_nodes).
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "resource_limit",
+                    "detail": "the search node limit was reached before "
+                              "cost optimality could be proven; the request "
+                              "id was not consumed and no inventory was "
+                              "reserved -- retry later or with a higher "
+                              "limits.max_search_nodes",
+                    "reason": "search_limit",
+                    "constraints": result.failure.detail,
+                    "retryable": True,
+                },
+            )
         payload = {
             "status": "infeasible",
             "request_id": request_id,
@@ -565,6 +596,7 @@ async def create_inventory_plan(
         ],
         "reservation_status": "stepwise" if stepwise else "reserved",
         "execution_mode": "stepwise" if stepwise else "whole",
+        **({"cost": plan_cost_payload(usage, costs)} if min_cost else {}),
         **({"progress": {
             "total_steps": len(plan["transfers"]),
             "registered_steps": [],
