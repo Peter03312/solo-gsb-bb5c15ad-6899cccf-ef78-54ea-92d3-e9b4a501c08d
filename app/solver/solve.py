@@ -1,6 +1,7 @@
 """Public solve() entry point: search, plan assembly and verification."""
 from __future__ import annotations
 
+import copy
 from fractions import Fraction
 from typing import Optional
 
@@ -25,6 +26,11 @@ class SearchLimit(Exception):
 
 
 def solve(prob: Problem) -> SolveResult:
+    # Minimum-stock-cost mode: the whole feasible plan space must be compared
+    # on total stock cost; the first feasible plan is not necessarily optimal.
+    if prob.stock_costs is not None:
+        return _solve_min_cost(prob)
+
     pip = make_pip(prob.pip_min, prob.pip_max, prob.pip_step)
 
     # ---- structural prechecks ------------------------------------------- #
@@ -51,7 +57,7 @@ def solve(prob: Problem) -> SolveResult:
         all_reasons: dict = {}
         for opt in opts:
             new_records = assign.apply(well, opt)
-            evaluated, reasons = assign.evaluate()
+            evaluated, reasons, _sources = assign.evaluate()
             if evaluated is not None:
                 sub = dfs(idx + 1)
                 if sub is not None and not sub:
@@ -73,7 +79,7 @@ def solve(prob: Problem) -> SolveResult:
         return SolveResult(ok=False, failure=_limit_failure(prob, wells))
 
     if reasons == {}:
-        evaluated, _ = assign.evaluate()
+        evaluated, _, _ = assign.evaluate()
         batches, container_map = evaluated
         plan = _assemble(prob, pip, assign, batches, container_map)
         verification = verify_plan(prob, pip, plan)
@@ -83,6 +89,126 @@ def solve(prob: Problem) -> SolveResult:
         return SolveResult(ok=True, plan=plan)
 
     return SolveResult(ok=False, failure=_explain(prob, pip, wells, reasons))
+
+
+# --------------------------------------------------------------------------- #
+# Minimum stock-cost search
+# --------------------------------------------------------------------------- #
+
+
+def _prefix_cost(prob: Problem, sources: dict) -> Fraction:
+    """Stock cost already forced by the current assignment prefix.
+
+    Because all unit costs are non-negative and every extension can only add
+    stock draws, this is a valid lower bound on the total cost of every plan
+    extending the prefix -- the branch-and-bound search may prune as soon as
+    this bound reaches the best complete-plan cost found so far.
+    """
+    total = Fraction(0)
+    for sid, nl in sources["stock_used"].items():
+        total += prob.stock_costs[sid] * nl
+    return total
+
+
+def _solve_min_cost(prob: Problem) -> SolveResult:
+    """Enumerate every feasible complete plan and keep the cheapest.
+
+    The comparison is whole-plan exact (rational arithmetic on the
+    bottom-up stock draws); there is no per-well greedy choice. A node budget
+    bounds the work: when it is exhausted before optimality is proved the
+    result is a ``search_limit`` failure that the API surfaces as a
+    retryable resource-limit error rather than freezing "no solution".
+    """
+    pip = make_pip(prob.pip_min, prob.pip_max, prob.pip_step)
+
+    pre = _prechecks(prob, pip)
+    if pre is not None:
+        return SolveResult(ok=False, failure=pre)
+
+    wells = sorted(prob.wells, key=_difficulty)
+    assign = Assignment(prob, pip)
+    nodes_used = 0
+    limit = prob.max_search_nodes
+
+    best_cost: Optional[Fraction] = None
+    best_plan: Optional[dict] = None
+
+    def dfs(idx: int) -> dict:
+        """Explore every option at ``wells[idx]``.
+
+        Returns an empty dict when the subtree contains a feasible complete
+        plan, otherwise a {well_id: {reason codes}} diagnostic -- the same
+        contract the feasibility-only DFS uses, so the no-solution report is
+        identical between the two modes.
+        """
+        nonlocal nodes_used, best_cost, best_plan
+        if idx == len(wells):
+            # A leaf is only reached after the prefix evaluated feasible, and
+            # feasibility (source budgets, containers, batch sizing) is
+            # monotone under adding wells, so this evaluation is feasible.
+            evaluated, _reasons, sources = assign.evaluate()
+            assert evaluated is not None
+            cost = _prefix_cost(prob, sources)
+            if best_cost is None or cost < best_cost:
+                batches, container_map = evaluated
+                best_cost = cost
+                best_plan = copy.deepcopy(
+                    _assemble(prob, pip, assign, batches, container_map))
+            return {}
+        nodes_used += 1
+        if nodes_used > limit:
+            raise SearchLimit()
+        well = wells[idx]
+        opts = generate_options(prob, pip, well)
+        if not opts:
+            return {well.id: {"no_fill_option"}}
+        subtree_feasible = False
+        all_reasons: dict = {}
+        for opt in opts:
+            new_records = assign.apply(well, opt)
+            evaluated, reasons, sources = assign.evaluate()
+            if evaluated is not None:
+                # Branch-and-bound: the forced prefix cost is a lower bound
+                # on every extension (unit costs are non-negative and a
+                # deeper prefix can only add draws). A branch that cannot
+                # beat the incumbent needs no exploration; it is a skip, not
+                # an infeasibility.
+                lb = _prefix_cost(prob, sources)
+                if best_cost is None or lb < best_cost:
+                    sub = dfs(idx + 1)
+                    if not sub:
+                        subtree_feasible = True
+                    else:
+                        for wid, codes in sub.items():
+                            all_reasons.setdefault(wid, set()).update(codes)
+            else:
+                for code in reasons:
+                    all_reasons.setdefault(well.id, set()).add(code)
+            assign.revert(well, new_records)
+        if subtree_feasible:
+            return {}
+        if not all_reasons:
+            all_reasons[well.id] = {"search_exhausted"}
+        return all_reasons
+
+    try:
+        reasons = dfs(0)
+    except SearchLimit:
+        # Even if a feasible plan was found before the cutoff, optimality was
+        # not proved: report the retryable resource limit, never the
+        # possibly-suboptimal plan and never "infeasible".
+        return SolveResult(ok=False, failure=_limit_failure(prob, wells))
+
+    if best_plan is not None:
+        verification = verify_plan(prob, pip, best_plan)
+        if verification is not None:
+            raise RuntimeError("solver produced invalid plan: " + verification)
+        return SolveResult(ok=True, plan=best_plan)
+
+    # Exhaustive search proved no feasible plan exists: the negative result
+    # is definitive and uses the same diagnostics as the normal solver.
+    return SolveResult(ok=False,
+                       failure=_explain(prob, pip, wells, reasons))
 
 
 # --------------------------------------------------------------------------- #

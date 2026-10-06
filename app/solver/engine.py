@@ -133,10 +133,16 @@ class Assignment:
     # ---- feasibility ------------------------------------------------------ #
 
     def evaluate(self):
-        """Compute bottom-up batches; return (batches, assignment, reasons).
+        """Compute bottom-up batches; return (batches, assignment, sources).
+
+        On success the third element is the source usage of the current
+        prefix: ``{"stock_used": {id: nl}, "diluent_used": nl}``. It is a
+        non-decreasing lower bound on the usage of any complete extension of
+        the prefix (a further well/recipe can only add draws), which the
+        minimum-cost search uses for branch-and-bound pruning.
 
         Reasons is a dict of short failure codes encountered (for diagnostics).
-        Returns (None, reasons) on failure.
+        Returns (None, reasons, None) on failure.
         """
         prob = self.prob
         demand = dict(self.demand)
@@ -160,11 +166,11 @@ class Assignment:
             cap = max(prob.containers) if prob.containers else 0
             if cap <= 0:
                 reasons.add("no_container")
-                return None, reasons
+                return None, reasons, None
             x = smallest_batch(d, cap, frac, self.pip)
             if x is None:
                 reasons.add("batch_capacity")
-                return None, reasons
+                return None, reasons, None
             batches[key] = x
             hi_nl = x * frac.numerator // frac.denominator
             lo_nl = x - hi_nl
@@ -188,15 +194,16 @@ class Assignment:
         assignment = _match(batches, order, prob.containers, caps)
         if assignment is None:
             reasons.add("container_shortage")
-            return None, reasons
+            return None, reasons, None
 
         # source budgets
         for sid, used in stock_used.items():
             if used > prob.stocks[sid]["volume"]:
                 reasons.add("stock_overdraft")
-                return None, reasons
+                return None, reasons, None
         if diluent_used > prob.diluent_volume:
             reasons.add("diluent_overdraft")
-            return None, reasons
+            return None, reasons, None
 
-        return (batches, assignment), reasons
+        sources = {"stock_used": stock_used, "diluent_used": diluent_used}
+        return (batches, assignment), reasons, sources

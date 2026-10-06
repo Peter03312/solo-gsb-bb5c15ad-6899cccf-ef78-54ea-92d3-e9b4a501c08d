@@ -23,6 +23,12 @@
   （`POST /batches/{id}/stocktakes`）：盘亏只从未预留可用量转入累计损耗
   （`loss_nl`），盘盈只回冲此前盘点确认的损耗；库存变动与盘点前后快照在同一
   事务原子封存，可按批次查询盘点历史。
+  库存计划还可选**最低母液成本模式**（请求体
+  `optimization: {"mode":"minimum_stock_cost", "batch_costs":[...]}`）：
+  为每个候选批次给出非负有理单位纳升成本，求解器在全部精确浓度/体积/移液器/
+  容器约束下**比较整份计划的母液总成本**（非逐孔贪心），返回成本最优计划、
+  各批次用量与成本及总成本；搜索预算不足以证明最优时返回**可重试**的
+  `503`（不冻结、不预留），确属无解仍按原语义冻结 `422`。
 
 - 体积一律使用**整数纳升（nL）**；
 - 浓度一律使用**有理数**（`fractions.Fraction`，输入如 `"2/3"`、`"0.25"`、`"40"`）；
@@ -155,7 +161,8 @@ docker compose up --build
 库存模式配液计划。请求头 `X-Request-ID`（**必填**），语义与 `/plans` 相同。
 
 请求体与 `/plans` 的唯一区别：用 `batch_ids`（已登记批次 ID 列表，至少 1 个、不可重复）
-替换 `stocks`；另可带 `execution_mode`（`"whole"` 默认 / `"stepwise"`）。
+替换 `stocks`；另可带 `execution_mode`（`"whole"` 默认 / `"stepwise"`）与
+可选 `optimization`（最低母液成本，见下文“最低母液成本模式”）。
 `diluent`、`wells`、`containers`、`pipette`、`default_well_capacity_nl`、
 `limits` 完全相同。求解沿用同一精确求解器，批次以其**当前可用量**参与求解。
 
@@ -173,7 +180,11 @@ docker compose up --build
   各批次的 `required_nl` 与 `available_nl`），并附 `inventory[]` 快照说明各批次余量。
   **失败结果同样被冻结，且不占用任何库存**。
 - `400 Bad Request`：非法数值/引用；引用未登记批次时 `error` 为 `unknown_batch`
-  （不冻结、不占库存，登记后可复用同一请求号重试）。
+  （不冻结、不占库存，登记后可复用同一请求号重试）；最低成本模式下成本缺失、
+  重复、覆盖非候选批次或为负值/非法有理值同样为 `400`（不冻结、不预留）。
+- `503 Service Unavailable`：**仅最低成本模式**，搜索节点预算耗尽、最优性
+  未证明（`error:"search_limit"`、`retryable:true`）；不冻结、不预留，
+  同一请求号可调大 `limits.max_search_nodes` 原样重试。
 
 ### `POST /inventory/plans/{request_id}/confirm`
 
@@ -404,6 +415,57 @@ docker compose up --build
 实时 `loss_nl` 字段；盘点确认的损耗与预留、已用一样从可用量中扣除，
 因此盘点后新计划只能按盘点后的可用量预留。
 
+### 最低母液成本模式（`optimization`）
+
+`POST /inventory/plans` 可选携带 `optimization` 块，按**整份计划的母液
+总成本**择优，而不是返回搜索到的第一份可行计划：
+
+```json
+"optimization": {
+  "mode": "minimum_stock_cost",
+  "batch_costs": [
+    {"batch_id": "B-HI", "unit_cost_nl": "100"},
+    {"batch_id": "B-LO", "unit_cost_nl": "1/10"}
+  ]
+}
+```
+
+- `unit_cost_nl` 为每转出一纳升母液的成本，必须是**非负有理数**
+  （整数或 `"2/3"`、`"0.25"` 形式的字符串；拒绝 JSON 浮点、负数与非法值）；
+- 开启时成本必须**恰好覆盖全部候选批次**（`batch_ids` 的每一个）：
+  缺失、重复、为非候选批次填写成本一律 `400 invalid_request`，
+  **不冻结请求号、不预留库存**，修正后可复用同一 `X-Request-ID`；
+  允许为 `0`（该批母液免费）。
+- 求解仍在**现有精确浓度、整数体积、移液器区间/步进、容器容量与库存
+  可用量约束**下进行：对每份可行的**整份计划**计算
+  `总成本 = Σ 该批实际转出 nL × 单位成本`（有理数精确运算，分支定界
+  搜索 + 前缀成本下界剪枝），返回总成本最小的计划；**不做逐孔贪心**——
+  中间液批量仍按整份下游需求自底向上取最小可行值，共享中间液、逐级
+  稀释链与容器匹配语义完全不变。
+- **成功响应**（`201`，同号同体重试 `200`）在原有 `plan` /
+  `reservations` / `reservation_status` 等字段之外另附 `optimization`：
+  - `mode`：`"minimum_stock_cost"`；
+  - `batches[]`：**每个候选批次**一行（按请求中的 `batch_ids` 顺序），
+    `{batch_id, used_nl, unit_cost_nl, cost}`（未取用批次 `used_nl:0`、
+    `cost:"0"`）；
+  - `total_cost`：整份计划的母液总成本（有理数字符串）。
+  预留量仍等于该最优计划实际转出的各批次体积，与冻结、原子预留、
+  confirm/cancel、逐步执行、召回、盘点语义完全一致（逐步模式可与
+  最低成本模式同时开启）。
+- **搜索上限无法证明最优**（`limits.max_search_nodes` 耗尽，即使此前
+  已找到可行计划）：返回 **`503 Service Unavailable`**
+  （`error:"search_limit"`、`status:"resource_limited"`、`retryable:true`，
+  附 `limits.max_search_nodes`）——这是**可重试的资源限制错误**：
+  **不冻结请求号、不预留库存**，可用同一 `X-Request-ID` 原样重试
+  （可调大 `limits.max_search_nodes`，上限 20,000,000）；绝不会把
+  未证明最优的结果冒充最优，也不会误报为无解或预留库存。
+- **确实无解**（库存不足 / 浓度不可达 / 容器不足等）仍按现有语义返回
+  **冻结的 `422`**（`insufficient_inventory` / `no_feasible_plan` …），
+  同号重试回放同一 `422`。
+- **未携带 `optimization` 的请求行为完全不变**（第一份可行计划、
+  原状态码与冻结语义）；同一 `X-Request-ID` 在“带/不带 `optimization`”
+  两种内容间重试仍按异内容处理为 `409 idempotency_conflict`。
+
 ### 执行差异复核（已完成 / 已中止的逐步计划）
 
 对**已经结束的库存逐步计划**（`completed` / `aborted`），可提交一份
@@ -565,6 +627,17 @@ bash examples/stocktake.sh
 python3 examples/stocktake_demo.py
 ```
 
+最低母液成本完整流程（登记高/低成本两批母液 → 全批次成本的最低成本计划，
+整份计划择优并原子预留 → 可执行转移、各批次用量/成本与总成本 →
+同号重试回放冻结最优解 → 缺失/多余/重复/负数成本 400 不冻结不预留 →
+搜索预算不足返回可重试 503、确属无解仍冻结 422 → 不带 optimization 的请求
+保持原行为 → confirm 后余额恰为最优用量）：
+
+```bash
+bash examples/min_cost.sh
+python3 examples/min_cost_demo.py
+```
+
 示例（1000 浓度母液，移液器 500–1000nL、步进 100nL，目标 A1=400、A2=100）会生成
 两个中间液（如 400 与 100），并把较大的批量安排进较大的容器，所有转移均为 500–1000nL。
 
@@ -596,9 +669,9 @@ app/
                    确认/取消、逐步登记/结案/中止、批次召回、执行差异复核、
                    库存盘点）
   models.py        Pydantic 请求/响应模型与浓度校验（含逐步登记、复核与
-                   盘点请求）
+                   盘点请求、最低母液成本 optimization）
   planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计、
-                   逐步进度与已用/待取统计、召回影响孔追踪（沿转移穿过中间液、
+                   最低成本报告、逐步进度与已用/待取统计、召回影响孔追踪（沿转移穿过中间液、
                    逐步计划按已执行步骤前缀追踪）、执行差异逐步比对与复核哈希、
                    盘点内容哈希
   db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、
@@ -609,17 +682,22 @@ app/
     core.py        数据结构、移液器可行性、最小批量
     options.py     候选方案（直接/双源/新中间液/逐级稀释链）
     engine.py      回溯状态、批量与容器可行性
-    solve.py       solve() 入口、计划组装、独立校验、无解诊断
+    solve.py       solve() 入口、计划组装、独立校验、无解诊断，
+                   及整份计划最低母液成本的分支定界搜索
 examples/          request.json、inventory.json、inventory_stepwise.json、
+                   inventory_min_cost.json、
                    curl.sh、inventory.sh、call_api.py、inventory_demo.py、
                    recall.sh、recall_demo.py、stepwise.sh、stepwise_demo.py、
-                   review.sh、review_demo.py、stocktake.sh、stocktake_demo.py
+                   review.sh、review_demo.py、stocktake.sh、stocktake_demo.py、
+                   min_cost.sh、min_cost_demo.py
 tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）、
                    test_api.py、test_solver.py、test_inventory.py（库存/并发）、
                    test_recall.py（召回/追踪/并发裁决）、
                    test_stepwise.py（逐步登记/结案/中止/召回并发）、
                    test_reviews.py（执行差异复核/幂等/冲突/只读）、
-                   test_stocktake.py（盘点判定/幂等/并发/历史）
+                   test_stocktake.py（盘点判定/幂等/并发/历史）、
+                   test_min_cost.py（最低成本求解器）、
+                   test_min_cost_api.py（最低成本 HTTP 语义）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -792,3 +870,41 @@ Dockerfile, docker-compose.yml, requirements.txt
    影响、逐步计划与中止交互、损耗影响后续预留、同号回放与异号冲突、
    召回/未知/非法拒绝不改库存、历史查询、同号并发只入账一次、并发盘点
    快照成链、盘点与计划/召回并发裁决）。
+
+---
+
+## 12. 本轮变动（最低母液成本模式）
+
+1. **新增整份计划最低母液成本择优**：`POST /inventory/plans` 请求体新增
+   可选 `optimization`（`mode:"minimum_stock_cost"` +
+   `batch_costs[]`）。开启后须为**每个候选批次**给出非负有理数
+   `unit_cost_nl`（单位：每 nL），求解器以分支定界（前缀成本下界剪枝、
+   有理数精确比较）枚举全部可行**整份计划**，取
+   `Σ 实际转出 nL × 单位成本` 最小者；中间液最小批量、共享中间液、
+   逐级稀释链、容器二分图匹配与独立质量守恒回放校验全部沿用，
+   **不做逐孔贪心**。未携带 `optimization` 的请求行为完全不变。
+2. **成本覆盖校验**：成本缺失、重复、命名非候选批次或为空一律
+   `400 invalid_request`（负成本、JSON 浮点、非法有理值同由模型校验
+   拒绝），**不冻结请求号、不预留库存**；成本允许为 `0`。
+3. **成功结果**：`201`（同号同体重试 `200`）在原字段外附
+   `optimization`：`mode`、每个候选批次一行的
+   `{batch_id, used_nl, unit_cost_nl, cost}`（未取用批次为 0）与
+   `total_cost`；预留量即最优计划的各批次实际转出量，冻结、原子预留、
+   confirm/cancel、逐步执行（可与最低成本模式同时开启）、召回、盘点
+   语义不变。
+4. **资源限制可重试与无解区分**：搜索预算（`limits.max_search_nodes`）
+   耗尽而最优性未证明时返回 **`503 search_limit`**
+   （`retryable:true`，附当前上限），**不冻结、不预留**，同一
+   `X-Request-ID` 可原样重试（可调大上限）；确属无解仍冻结 `422`
+   （`insufficient_inventory` / `no_feasible_plan`），同号重试回放。
+5. **兼容性**：`/plans`、`/batches`、库存计划既有字段、幂等哈希（新增
+   `optimization` 参与哈希，带/不带该块按异内容 `409` 裁决）、状态码与
+   冻结语义、`docker compose up` 启动方式与健康检查均保持可用；
+   本轮无新增表或环境变量；版本号升至 `1.6.0`。
+6. **用法与测试**：新增 `examples/inventory_min_cost.json`、
+   `examples/min_cost.sh`、`examples/min_cost_demo.py`（仅标准库）；
+   新增 `tests/test_min_cost.py`（分支择优、有理数成本精确比较、库存
+   约束下回退、零成本、串行稀释链记账、搜索上限与无解区分、默认模式
+   不变）与 `tests/test_min_cost_api.py`（成本报告、原子预留、同号回放、
+   四类成本 400、503 可重试且不冻结、422 冻结、逐步模式叠加、
+   生命周期与向后兼容）。

@@ -60,7 +60,15 @@ def build_inventory_problem(req: InventoryPlanIn, batches: dict) -> Problem:
         }
         for bid in req.batch_ids
     }
-    return _problem(req, stocks)
+    prob = _problem(req, stocks)
+    if req.optimization is not None:
+        # Whole-plan minimum stock cost: exact non-negative rational unit
+        # cost per nanoliter for every candidate batch.
+        prob.stock_costs = {
+            c.batch_id: Fraction(c.unit_cost_nl)
+            for c in req.optimization.batch_costs
+        }
+    return prob
 
 
 def stock_usage_from_plan(plan: dict) -> dict:
@@ -169,6 +177,54 @@ def cross_validate_inventory(req: InventoryPlanIn) -> None:
     if len(set(req.batch_ids)) != len(req.batch_ids):
         raise ValueError("duplicate batch id")
     _validate_common(req)
+    if req.optimization is not None:
+        # Minimum-cost mode requires an exact non-negative unit cost for
+        # every candidate batch; nothing missing, nothing duplicated,
+        # nothing extra. Non-negative/rational/type checks already happened
+        # in the pydantic field validator.
+        opt = req.optimization
+        cost_ids = [c.batch_id for c in opt.batch_costs]
+        if len(set(cost_ids)) != len(cost_ids):
+            raise ValueError("duplicate batch cost entry")
+        missing = [b for b in req.batch_ids if b not in set(cost_ids)]
+        if missing:
+            raise ValueError(
+                "optimization.batch_costs must cover every candidate batch; "
+                "missing unit cost for: " + ", ".join(missing))
+        extra = [b for b in cost_ids if b not in set(req.batch_ids)]
+        if extra:
+            raise ValueError(
+                "optimization.batch_costs may only name candidate batches; "
+                "unexpected: " + ", ".join(extra))
+
+
+def min_cost_report(plan: dict, costs: dict, candidate_ids: list[str]) -> dict:
+    """Per-batch usage/cost and whole-plan total stock cost.
+
+    Costs are computed with exact rational arithmetic on the actual stock
+    drawn in the frozen plan; every candidate batch is listed (zero-draw
+    batches carry zero usage and zero cost). The plan-level total is the
+    sum over the batches actually drawn.
+    """
+    usage = stock_usage_from_plan(plan)
+    items = []
+    total = Fraction(0)
+    for bid in candidate_ids:
+        nl = usage.get(bid, 0)
+        cost = costs[bid] * nl
+        total += cost
+        items.append({
+            "batch_id": bid,
+            "used_nl": nl,
+            "unit_cost_nl": str(costs[bid]),
+            "cost": str(cost),
+        })
+    return {
+        "mode": "minimum_stock_cost",
+        "currency": "per_nl_unit_cost",
+        "batches": items,
+        "total_cost": str(total),
+    }
 
 
 def canonical_request(req) -> bytes:

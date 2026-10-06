@@ -72,6 +72,11 @@ class Problem:
     max_search_nodes: int = 200_000
     max_enumeration_units: int = 20_000
     max_factor: int = 200_000
+    # Minimum-stock-cost optimization: when set, it maps every stock id to a
+    # non-negative Fraction unit cost per nanoliter, and solve() searches the
+    # whole plan space for the plan minimizing sum(volume_drawn * unit_cost).
+    # When None the solver returns the first feasible plan (default behavior).
+    stock_costs: Optional[dict] = None
 
     # populated during solving
     recipes: dict = field(default_factory=dict)

@@ -159,6 +159,41 @@ class BatchRegisterIn(BaseModel):
         return Concentration.validate(v)
 
 
+class BatchCostIn(BaseModel):
+    """Unit cost of one candidate batch, per nanoliter drawn.
+
+    Costs are exact non-negative rationals (integer or rational string,
+    never a JSON float), mirroring concentration input.
+    """
+    batch_id: str = Field(min_length=1, max_length=64)
+    unit_cost_nl: Union[str, int]
+
+    @field_validator("batch_id")
+    @classmethod
+    def _id(cls, v):
+        if v.startswith("@"):
+            raise ValueError("ids must not start with '@' (reserved prefix)")
+        return v
+
+    @field_validator("unit_cost_nl")
+    @classmethod
+    def _cost(cls, v):
+        return Concentration.validate(v, "unit_cost_nl")
+
+
+class OptimizationIn(BaseModel):
+    """Optimization objective for an inventory plan.
+
+    ``mode: "minimum_stock_cost"`` switches the solver from first-feasible to
+    whole-plan minimum total stock cost. When enabled, ``batch_costs`` must
+    name **every** candidate batch exactly once with a non-negative unit
+    cost per nanoliter; missing, duplicate, unknown or extra batch costs are
+    rejected with 400.
+    """
+    mode: Literal["minimum_stock_cost"]
+    batch_costs: list[BatchCostIn] = Field(min_length=1)
+
+
 class InventoryPlanIn(BaseModel):
     """Plan request that draws from registered batches instead of
     request-local stock definitions.
@@ -171,6 +206,10 @@ class InventoryPlanIn(BaseModel):
       the experimenter; each stock-source registration moves that step's
       reserved volume to ``used_nl``, and the plan is finalized (``complete``)
       or ``abort``ed explicitly.
+
+    ``optimization`` optionally requests whole-plan minimum stock cost
+    (see :class:`OptimizationIn`); when absent the request keeps the original
+    first-feasible behavior.
     """
     batch_ids: list[str] = Field(min_length=1)
     diluent: DiluentIn
@@ -180,6 +219,7 @@ class InventoryPlanIn(BaseModel):
     default_well_capacity_nl: int = Field(gt=0)
     limits: LimitsIn = Field(default_factory=LimitsIn)
     execution_mode: Literal["whole", "stepwise"] = "whole"
+    optimization: Optional[OptimizationIn] = None
 
     @field_validator("batch_ids")
     @classmethod

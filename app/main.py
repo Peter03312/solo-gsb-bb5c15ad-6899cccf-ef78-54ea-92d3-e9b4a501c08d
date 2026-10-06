@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from fractions import Fraction
 
 from fastapi import FastAPI, Header, Request
 from fastapi.encoders import jsonable_encoder
@@ -47,6 +48,7 @@ from .planning import (
     cross_validate_inventory,
     cross_validate_references,
     frozen_transfer,
+    min_cost_report,
     relabel_plan,
     request_hash,
     review_content_hash,
@@ -71,7 +73,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microplate Dilution Planner",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Computes an exact, executable pipetting plan for microplate wells. "
         "Volumes are integer nanoliters; concentrations are rationals. "
@@ -80,15 +82,19 @@ app = FastAPI(
         "Inventory plans may alternatively run in stepwise execution mode: "
         "the experimenter registers each frozen transfer in order, stock is "
         "charged only as its stock-out steps are registered, and the plan is "
-        "completed or aborted explicitly. Contaminated batches can be "
-        "irrevocably recalled: new reservations and pending steps/confirms "
-        "are rejected, and the frozen recall report traces affected plans "
-        "and target wells (for stepwise plans, only the executed path) "
-        "through intermediate liquids. Physical stocktakes reconcile the "
-        "book balance with the measured volume: deficits move from the "
-        "unreserved available pool into a cumulative loss, surpluses only "
-        "offset previously confirmed losses, and every count is sealed "
-        "atomically with its before/after snapshot."
+        "completed or aborted explicitly. Inventory plans may also request "
+        "whole-plan minimum stock cost: exact per-batch unit costs are given "
+        "for every candidate batch and the search compares complete plans "
+        "(never per-well greedily); an unprovable optimum is a retryable "
+        "resource-limit error. Contaminated batches can be irrevocably "
+        "recalled: new reservations and pending steps/confirms are rejected, "
+        "and the frozen recall report traces affected plans and target wells "
+        "(for stepwise plans, only the executed path) through intermediate "
+        "liquids. Physical stocktakes reconcile the book balance with the "
+        "measured volume: deficits move from the unreserved available pool "
+        "into a cumulative loss, surpluses only offset previously confirmed "
+        "losses, and every count is sealed atomically with its before/after "
+        "snapshot."
     ),
     lifespan=lifespan,
 )
@@ -532,7 +538,33 @@ async def create_inventory_plan(
     prob = build_inventory_problem(req, batches)
     result = solve(prob)
 
+    min_cost = req.optimization is not None
+
     if not result.ok:
+        # Minimum-cost mode: if the search budget was exhausted before the
+        # optimum was proved, the outcome is a *retryable resource limit*,
+        # not "no solution": the request id is not frozen and no inventory
+        # is reserved, so the identical X-Request-ID can be retried (with a
+        # larger limits.max_search_nodes if desired). A definitive
+        # infeasibility still uses the existing frozen-422 semantics.
+        if min_cost and result.failure.reason == "search_limit":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "search_limit",
+                    "status": "resource_limited",
+                    "detail": "the search node budget was exhausted before "
+                              "the minimum-cost optimum could be proved; "
+                              "retry the same request (optionally with a "
+                              "larger limits.max_search_nodes)",
+                    "request_id": request_id,
+                    "retryable": True,
+                    "limits": {
+                        "max_search_nodes": result.failure.detail.get(
+                            "max_search_nodes"),
+                    },
+                },
+            )
         payload = {
             "status": "infeasible",
             "request_id": request_id,
@@ -578,6 +610,11 @@ async def create_inventory_plan(
             ],
         }} if stepwise else {}),
     }
+    if min_cost:
+        costs = {c.batch_id: Fraction(c.unit_cost_nl)
+                 for c in req.optimization.batch_costs}
+        payload["optimization"] = min_cost_report(
+            plan, costs, list(req.batch_ids))
     outcome, detail = await reserve_and_freeze(
         app.state.db, request_id, rhash, payload, usage, req.execution_mode)
     if outcome == "ok":

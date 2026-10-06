@@ -1,0 +1,19 @@
+{
+  "batch_ids": ["B-HI", "B-LO"],
+  "diluent": {"available_nl": 10000000},
+  "wells": [
+    {"id": "A1", "final_volume_nl": 1000, "final_concentration": "125"},
+    {"id": "A2", "final_volume_nl": 1000, "final_concentration": "75"},
+    {"id": "A3", "final_volume_nl": 1000, "final_concentration": "0"}
+  ],
+  "containers": [],
+  "pipette": {"min_nl": 25, "max_nl": 1000, "step_nl": 25},
+  "default_well_capacity_nl": 5000,
+  "optimization": {
+    "mode": "minimum_stock_cost",
+    "batch_costs": [
+      {"batch_id": "B-HI", "unit_cost_nl": "100"},
+      {"batch_id": "B-LO", "unit_cost_nl": "1/10"}
+    ]
+  }
+}
